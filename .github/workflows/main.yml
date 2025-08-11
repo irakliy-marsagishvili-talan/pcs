@@ -1,0 +1,170 @@
+name: Product Catalog CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+env:
+  MAVEN_OPTS: "-Dmaven.repo.local=${{ github.workspace }}/.m2/repository"
+  MAVEN_CLI_OPTS: "--batch-mode --errors --fail-at-end --show-version"
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  AWS_DEFAULT_REGION: eu-central-1
+  CONTAINER_TOOL: docker
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Run Maven Tests
+        run: |
+          chmod +x mvnw
+          ./mvnw $MAVEN_CLI_OPTS clean compile
+          ./mvnw $MAVEN_CLI_OPTS test
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: target/
+
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsRole
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and Push Docker Image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          docker build -t ${{ secrets.ECR_REGISTRY }}/product-catalog-service:$IMAGE_TAG .
+          docker tag ${{ secrets.ECR_REGISTRY }}/product-catalog-service:$IMAGE_TAG ${{ secrets.ECR_REGISTRY }}/product-catalog-service:latest
+          docker push ${{ secrets.ECR_REGISTRY }}/product-catalog-service:$IMAGE_TAG
+          docker push ${{ secrets.ECR_REGISTRY }}/product-catalog-service:latest
+          docker inspect --format='{{index .RepoDigests 0}}' ${{ secrets.ECR_REGISTRY }}/product-catalog-service:$IMAGE_TAG > image-digest.txt
+
+      - name: Upload Image Digest
+        uses: actions/upload-artifact@v3
+        with:
+          name: image-digest
+          path: image-digest.txt
+  deploy:
+    name: Deploy to AWS ECS
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: http://${{ secrets.ALB_DNS_NAME }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsRole
+
+      - name: Create ECS Task Definition
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          cat > task-definition.json <<EOF
+          {
+            "family": "product-catalog-service",
+            "taskRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskRole",
+            "executionRoleArn": "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "containerDefinitions": [
+              {
+                "name": "product-catalog",
+                "image": "${{ secrets.ECR_REGISTRY }}/product-catalog-service:$IMAGE_TAG",
+                "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
+                "essential": true,
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/product-catalog-service",
+                    "awslogs-region": "${{ env.AWS_DEFAULT_REGION }}",
+                    "awslogs-stream-prefix": "ecs"
+                  }
+                },
+                "environment": [
+                  {"name": "DB_HOST", "value": "${{ secrets.DB_HOST }}"},
+                  {"name": "DB_PORT", "value": "5432"},
+                  {"name": "DB_NAME", "value": "productcatalog"},
+                  {"name": "DB_USERNAME", "value": "${{ secrets.DB_USERNAME }}"},
+                  {"name": "DB_PASSWORD", "value": "${{ secrets.DB_PASSWORD }}"}
+                ],
+                "healthCheck": {
+                  "command": ["CMD-SHELL", "curl -f http://localhost:8080/actuator/health || exit 1"],
+                  "interval": 30,
+                  "timeout": 5,
+                  "retries": 3,
+                  "startPeriod": 60
+                }
+              }
+            ]
+          }
+          EOF
+
+      - name: Register ECS Task Definition
+        run: aws ecs register-task-definition --cli-input-json file://task-definition.json
+
+      - name: Update ECS Service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER_NAME }} \
+            --service product-catalog-service \
+            --task-definition product-catalog-service
+
+      - name: Wait for ECS Deployment
+        run: aws ecs wait services-stable --cluster ${{ secrets.ECS_CLUSTER_NAME }} --services product-catalog-service
+
+  test_deployment:
+    name: Test Deployment
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Test Health Endpoint
+        run: curl -f http://${{ secrets.ALB_DNS_NAME }}/actuator/health
+      - name: Test API Endpoint
+        run: curl -f http://${{ secrets.ALB_DNS_NAME }}/api/products
