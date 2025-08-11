@@ -1,0 +1,25 @@
+# Get your AWS account ID
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# Get login token for Docker
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 820183542378.dkr.ecr.eu-central-1.amazonaws.com
+
+# Tag image for ECR
+docker tag product-catalog-service:latest 820183542378.dkr.ecr.eu-central-1.amazonaws.com/product-catalog-service:latest
+
+# Also tag with version for traceability
+docker tag product-catalog-service:latest 820183542378.dkr.ecr.us-east-1.amazonaws.com/product-catalog-service:1.0.0
+
+# Push both tags
+docker push 820183542378.dkr.ecr.eu-central-1.amazonaws.com/product-catalog-service:latest
+docker push 820183542378.dkr.ecr.eu-central-1.amazonaws.com/product-catalog-service:1.0.0
+
+# Verify images in ECR
+aws ecr list-images --repository-name product-catalog-service
+
+aws ecr create-repository --repository-name product-catalog-service --region eu-central-1
+
+# Get repository URI (save this for later)
+aws ecr describe-repositories --repository-names product-catalog-service --query 'repositories[0].repositoryUri' --output text
+```
+820183542378.dkr.ecr.eu-central-1.amazonaws.com/product-catalog-service
