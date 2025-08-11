@@ -8,7 +8,7 @@ aws ecr get-login-password --region us-east-1 | docker login --username AWS --pa
 docker tag product-catalog-service:latest 820183542378.dkr.ecr.eu-central-1.amazonaws.com/product-catalog-service:latest
 
 # Also tag with version for traceability
-docker tag product-catalog-service:latest 820183542378.dkr.ecr.us-east-1.amazonaws.com/product-catalog-service:1.0.0
+docker tag product-catalog-service:latest 820183542378.dkr.ecr.eu-central-1.amazonaws.com/product-catalog-service:1.0.0
 
 # Push both tags
 docker push 820183542378.dkr.ecr.eu-central-1.amazonaws.com/product-catalog-service:latest
